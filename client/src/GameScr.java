@@ -185,6 +185,10 @@ public final class GameScr extends Canvas implements Runnable {
     // ---- lelang
     private int lelangMode = 0;      // 0 papan umum, 1 lapak saya
     private int lelangHalaman = 0;
+    // ---- input harga lelang
+    private boolean inputHargaAktif = false;
+    private String hargaInput = "";
+    private int hargaSlot = -1;
     private int nLelang = 0;
     private final int[] lelangId = new int[12];
     private final String[] lelangPenjual = new String[12];
@@ -238,7 +242,6 @@ public final class GameScr extends Canvas implements Runnable {
         int detak = 0;
         while (jalan) {
             long t0 = System.currentTimeMillis();
-
             Msg.Baca r = net.ambil();
             while (r != null) {
                 tangani(r);
@@ -946,6 +949,23 @@ public final class GameScr extends Canvas implements Runnable {
             g.setColor(0xFFE9A8);
             g.drawString(pesanBawah, 4, h - 13, Graphics.LEFT | Graphics.TOP);
         }
+        // overlay input harga lelang
+        if (inputHargaAktif) {
+            int bx = 10, by = h / 2 - 24, bw = w - 20, bh = 48;
+            g.setColor(0x0B0F14);
+            g.fillRect(bx, by, bw, bh);
+            g.setColor(0x3E5871);
+            g.drawRect(bx, by, bw, bh);
+            g.setColor(0xFFD54A);
+            g.drawString("Harga lelang:", bx + 6, by + 4,
+                    Graphics.LEFT | Graphics.TOP);
+            g.setColor(0xFFFFFF);
+            String tampil = hargaInput.length() == 0 ? "_" : hargaInput + "g";
+            g.drawString(tampil, bx + 6, by + 18, Graphics.LEFT | Graphics.TOP);
+            g.setColor(0x8FA3B7);
+            g.drawString("OK pasang  * hapus  # batal", bx + 6, by + 33,
+                    Graphics.LEFT | Graphics.TOP);
+        }
     }
 
     private void kotak(Graphics g, int w, int h, String judul) {
@@ -1258,6 +1278,37 @@ public final class GameScr extends Canvas implements Runnable {
             aksi = getGameAction(kode);
         } catch (Exception e) {
         }
+        // mode input harga lelang: intersep semua kunci
+        if (inputHargaAktif) {
+            if (kode >= KEY_NUM0 && kode <= KEY_NUM9 && hargaInput.length() < 9) {
+                hargaInput += (char) kode;
+            } else if (kode == KEY_STAR) {
+                // hapus satu digit
+                if (hargaInput.length() > 0) {
+                    hargaInput = hargaInput.substring(0, hargaInput.length() - 1);
+                }
+            } else if ((kode == KEY_NUM5 || aksi == FIRE) && hargaInput.length() > 0) {
+                try {
+                    int harga = Integer.parseInt(hargaInput);
+                    if (harga > 0) {
+                        pasangLelang(hargaSlot, harga);
+                        info("lapak dipasang " + harga + "g");
+                    } else {
+                        info("harga harus > 0");
+                    }
+                } catch (NumberFormatException ex) {
+                    info("harga tidak valid");
+                }
+                inputHargaAktif = false;
+                hargaInput = "";
+            } else if (kode == KEY_POUND) {
+                inputHargaAktif = false;
+                hargaInput = "";
+                info("batal");
+            }
+            repaint();
+            return;
+        }
         if (panel != P_TIDAK) {
             tombolPanel(kode, aksi);
             return;
@@ -1369,9 +1420,12 @@ public final class GameScr extends Canvas implements Runnable {
             } else if (kode == KEY_NUM9 && pilih < nEq) {
                 net.kirim(new Msg.Tulis(Msg.C_LEPAS_EQUIP).b(eqSlot[pilih]));
             } else if (kode == KEY_STAR && pilih < nInv) {
-                // pasang 1 buah ke papan lelang dengan harga dasar 1000 gold
-                pasangLelang(invSlot[pilih], 1000);
-                info("lapak dipasang 1000g - ubah lewat chat /lapak");
+                // buka mode input harga lelang
+                hargaSlot = invSlot[pilih];
+                hargaInput = "";
+                inputHargaAktif = true;
+                panel = P_TIDAK;   // tutup panel selama input
+                info("ketik harga, OK pasang, * hapus, # batal");
             }
         } else if (panel == P_TOKO) {
             if (kode == KEY_NUM5 || aksi == FIRE) {
