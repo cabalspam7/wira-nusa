@@ -38,16 +38,34 @@ class Sesi(object):
         self.sock = sock
         self.alamat = alamat
         self.potong = P.Pemotong()
+        self._wbuf = bytearray()
         self.akun_id = None
         self.pemain = None
         self.hidup = True
         self.terakhir = sekarang()
 
     def kirim(self, paket):
+        """Kirim langsung (respons per-sesi, dari thread layani)."""
         if not self.hidup:
             return
         try:
             self.sock.sendall(paket)
+        except OSError:
+            self.tutup()
+
+    def kirim_buf(self, paket):
+        """Tahan di buffer; dipakai oleh ke_peta saat tick broadcast."""
+        if self.hidup:
+            self._wbuf += paket
+
+    def flush_buf(self):
+        """Kirim semua yang ada di buffer sekaligus (satu sendall)."""
+        if not self._wbuf or not self.hidup:
+            return
+        data = bytes(self._wbuf)
+        self._wbuf = bytearray()
+        try:
+            self.sock.sendall(data)
         except OSError:
             self.tutup()
 
@@ -88,6 +106,7 @@ class Server(object):
         return self.sesi.get(pemain.eid)
 
     def ke_peta(self, map_id, paket, kecuali=None):
+        """Buffer broadcast per tick; flush_semua() kirim semuanya."""
         peta = self.dunia.peta.get(map_id)
         if not peta:
             return
@@ -96,7 +115,7 @@ class Server(object):
                 continue
             s = self.sesi.get(p.eid)
             if s:
-                s.kirim(paket)
+                s.kirim_buf(paket)
 
     def ke_pemain(self, pemain, paket):
         s = self.sesi.get(pemain.eid)
@@ -219,6 +238,7 @@ class Server(object):
             lawan = t.lawan(sisi)
             self.ke_pemain(sisi, P.Tulis(P.S_TRADE).b(1).i(lawan.eid)
                            .teks(lawan.nama).paket())
+
         self.kirim_trade_update(t)
 
     # ------------------------------------------------------ paket guild
@@ -939,6 +959,7 @@ class Server(object):
             err, lid = PASAR.pasang_lelang(self.con, pemain, slot, jumlah, harga)
             if err:
                 return sesi.pesan(err)
+            DB.simpan_karakter(self.con, pemain.sebagai_baris())
             DB.simpan_item(self.con, pemain.char_id, pemain.inv, pemain.eq)
             sesi.kirim(self.paket_inventori(pemain))
             sesi.pesan("lapak dipasang (id %d)" % lid)
@@ -990,6 +1011,9 @@ class Server(object):
             with self.kunci:
                 for ev in self.dunia.tick():
                     self.siarkan_peristiwa(ev)
+                # koalesensi: kirim semua buffer broadcast sekaligus
+                for s in list(self.sesi.values()):
+                    s.flush_buf()
                 if time.time() >= simpan_pada:
                     simpan_pada = time.time() + 30
                     self.simpan_semua()
