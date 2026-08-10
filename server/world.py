@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
-"""Logika dunia WIRA NUSA: entitas, tempur, AI mob, drop, party, ekonomi.
+"""Model dunia WIRA NUSA: pemain, mob, drop, portal, tempur, guild, war.
 
-Semua di sini murni logika -- tidak ada socket. Itu bikin selftest bisa
-menjalankan seluruh game tanpa jaringan, dan bikin server bisa diganti
-transportnya (TCP sekarang, WebSocket nanti) tanpa menyentuh file ini.
-
-Prinsip yang dipegang: CLIENT TIDAK PERNAH MENGIRIM ANGKA DAMAGE.
-Client cuma mengirim niat. Semua hasil dihitung dan divalidasi di sini.
+Semua mutasi state game HARUS lewat fungsi di modul ini saja, dilindungi
+oleh kunci global di app.py. Tidak ada I/O, tidak ada threading di sini.
 """
 
 import random
@@ -19,590 +15,640 @@ def sekarang():
     return int(time.time() * 1000)
 
 
-class Entitas(object):
-    def __init__(self, eid, x, y=0):
-        self.eid = eid
-        self.x = x
-        self.y = y
-        self.arah = 1
-        self.hp = 1
-        self.hp_maks = 1
-        self.mati_pada = 0
-        self.hidup = True
-
-    def jarak_ke(self, lain):
-        dx = self.x - lain.x
-        dy = self.y - lain.y
-        return (dx * dx + dy * dy) ** 0.5
+_eid_counter = [0]
 
 
-class Pemain(Entitas):
-    def __init__(self, eid, data, inv, eq):
-        Entitas.__init__(self, eid, data["x"])
-        self.char_id = data["id"]
-        self.akun_id = data["akun_id"]
-        self.nama = data["nama"]
-        self.job = data["job"]
-        self.rambut = data["rambut"]
-        self.kulit = data["kulit"]
-        self.level = data["level"]
-        self.exp = data["exp"]
-        self.gold = data["gold"]
-        self.map_id = data["map_id"]
-        self.poin = data["poin"]
-        self.skill = dict(data["skill"])
-        self.quest = dict(data.get("quest") or {})
-        self.inv = inv
-        self.eq = eq
-        self.buff = {}          # nama -> (kadaluarsa_ms, persen)
-        self.cd = {}            # skill_id -> siap_pada_ms
-        self.party = None
-        self.trade = None
-        self.guild = None        # guild_id, diisi saat login
-        self.gerak_terakhir = sekarang()
-        self.pelanggaran = 0
-        self.mp = 0
-        self.mp_maks = 1
-        self.hitung_stat()
-        self.hp = data["hp"] or self.hp_maks
-        self.mp = data["mp"] or self.mp_maks
-        self.hp = min(self.hp, self.hp_maks)
-        self.mp = min(self.mp, self.mp_maks)
-
-    # ---------------------------------------------------------- statistik
-    def hitung_stat(self):
-        dasar = G.statistik_dasar(self.job, self.level)
-        atk = dasar["atk"]
-        dfn = dasar["dfn"]
-        hp_maks = dasar["hp_maks"]
-        mp_maks = dasar["mp_maks"]
-        for it in self.eq.values():
-            info = G.ITEM.get(it["id"])
-            if not info:
-                continue
-            plus = it.get("plus", 0)
-            atk += G.stat_upgrade(info.get("atk", 0), plus)
-            dfn += G.stat_upgrade(info.get("dfn", 0), plus)
-            hp_maks += info.get("hp", 0)
-            mp_maks += info.get("mp", 0)
-        skr = sekarang()
-        for nama, (habis, persen) in list(self.buff.items()):
-            if habis <= skr:
-                del self.buff[nama]
-                continue
-            if nama == "atk":
-                atk += atk * persen // 100
-            elif nama == "dfn":
-                dfn += dfn * persen // 100
-        self.atk = atk
-        self.dfn = dfn
-        self.jarak = dasar["jarak"]
-        self.hp_maks = hp_maks
-        self.mp_maks = mp_maks
-        if self.hp > self.hp_maks:
-            self.hp = self.hp_maks
-        if self.mp > self.mp_maks:
-            self.mp = self.mp_maks
-
-    def sebagai_baris(self):
-        """Data yang disimpan balik ke DB."""
-        return dict(id=self.char_id, level=self.level, exp=self.exp,
-                    gold=self.gold, hp=self.hp, mp=self.mp, map_id=self.map_id,
-                    x=int(self.x), poin=self.poin, skill=self.skill)
-
-    # --------------------------------------------------------- inventori
-    def slot_kosong(self):
-        for s in range(G.INVENTORI_MAKS):
-            if s not in self.inv:
-                return s
-        return -1
-
-    def tambah_item(self, item_id, jumlah=1, plus=0):
-        info = G.ITEM.get(item_id)
-        if not info:
-            return False
-        tumpuk = info.get("tumpuk", 1)
-        if tumpuk > 1 and plus == 0:
-            for it in self.inv.values():
-                if it["id"] == item_id and it["jumlah"] < tumpuk:
-                    ruang = tumpuk - it["jumlah"]
-                    ambil = min(ruang, jumlah)
-                    it["jumlah"] += ambil
-                    jumlah -= ambil
-                    if jumlah <= 0:
-                        return True
-        while jumlah > 0:
-            slot = self.slot_kosong()
-            if slot < 0:
-                return False
-            ambil = min(jumlah, tumpuk)
-            self.inv[slot] = dict(id=item_id, jumlah=ambil, plus=plus)
-            jumlah -= ambil
-        return True
-
-    def buang_item(self, slot, jumlah=1):
-        it = self.inv.get(slot)
-        if not it or it["jumlah"] < jumlah:
-            return False
-        it["jumlah"] -= jumlah
-        if it["jumlah"] <= 0:
-            del self.inv[slot]
-        return True
-
-    def punya_item(self, item_id, jumlah=1):
-        total = sum(it["jumlah"] for it in self.inv.values() if it["id"] == item_id)
-        return total >= jumlah
-
-    def pakai_bahan(self, item_id, jumlah):
-        if not self.punya_item(item_id, jumlah):
-            return False
-        for slot in sorted(self.inv.keys()):
-            if jumlah <= 0:
-                break
-            it = self.inv[slot]
-            if it["id"] != item_id:
-                continue
-            ambil = min(it["jumlah"], jumlah)
-            it["jumlah"] -= ambil
-            jumlah -= ambil
-            if it["jumlah"] <= 0:
-                del self.inv[slot]
-        return True
-
-    # ------------------------------------------------------------- level
-    def beri_exp(self, jumlah):
-        naik = 0
-        self.exp += jumlah
-        while self.level < G.LEVEL_MAKS:
-            butuh = G.exp_untuk(self.level)
-            if self.exp < butuh:
-                break
-            self.exp -= butuh
-            self.level += 1
-            self.poin += 1
-            naik += 1
-        if self.level >= G.LEVEL_MAKS:
-            self.exp = 0
-        if naik:
-            self.hitung_stat()
-            self.hp = self.hp_maks
-            self.mp = self.mp_maks
-        return naik
-
-
-class MobHidup(Entitas):
-    def __init__(self, eid, mob_id, x, tanah):
-        Entitas.__init__(self, eid, x, tanah)
-        self.mob_id = mob_id
-        info = G.MOB[mob_id]
-        self.info = info
-        self.hp_maks = info["hp"]
-        self.hp = info["hp"]
-        self.rumah_x = x
-        self.target = None
-        self.serang_pada = 0
-        self.kontribusi = {}   # char_id -> damage, untuk pembagian exp
-
-    def reset(self):
-        self.hp = self.hp_maks
-        self.hidup = True
-        self.target = None
-        self.kontribusi = {}
-        self.x = self.rumah_x
-
-
-class Trade(object):
-    """Satu sesi dagang dua arah.
-
-    Aturan yang bikin ini aman: penawaran disimpan sebagai (slot, jumlah)
-    milik server, bukan daftar item yang dikirim client; setiap perubahan
-    penawaran otomatis membuka kunci kedua pihak; dan isi tas dicek ulang
-    tepat sebelum barang berpindah.
-    """
-
-    def __init__(self, tid, a, b):
-        self.id = tid
-        self.a = a
-        self.b = b
-        self.aktif = False
-        self.waktu = sekarang()
-        self.tawar = {a.char_id: dict(gold=0, item=[]),
-                      b.char_id: dict(gold=0, item=[])}
-        self.kunci = {a.char_id: False, b.char_id: False}
-
-    def lawan(self, pemain):
-        return self.b if pemain.char_id == self.a.char_id else self.a
+def _next_eid():
+    _eid_counter[0] += 1
+    return _eid_counter[0]
 
 
 class Drop(object):
-    def __init__(self, did, item_id, jumlah, plus, x, pemilik, waktu):
+    def __init__(self, did, item_id, jumlah, plus, x, pemilik_id=None):
         self.did = did
         self.item_id = item_id
         self.jumlah = jumlah
         self.plus = plus
         self.x = x
-        self.pemilik = pemilik   # char_id yang berhak duluan
-        self.waktu = waktu
+        self.pemilik_id = pemilik_id
+        self.waktu = sekarang()
+
+
+class Pemain(object):
+    def __init__(self, char_id, nama, job, rambut, kulit, level, exp, gold,
+                 hp, hp_maks, mp, mp_maks, atk, dfn, poin, skill,
+                 map_id, x):
+        self.eid = _next_eid()
+        self.char_id = char_id
+        self.nama = nama
+        self.job = job
+        self.rambut = rambut
+        self.kulit = kulit
+        self.level = level
+        self.exp = exp
+        self.gold = gold
+        self.hp = hp
+        self.hp_maks = hp_maks
+        self.mp = mp
+        self.mp_maks = mp_maks
+        self.atk = atk
+        self.dfn = dfn
+        self.poin = poin
+        self.skill = skill
+        self.map_id = map_id
+        self.x = x
+        self.y = G.TANAH_Y
+        self.arah = 1
+        self.hidup = True
+        self.mati_pada = 0
+        self.inv = {}   # slot -> {id, jumlah, plus}
+        self.eq = {}    # slot -> {id, jumlah, plus}
+        self.quest = {} # qid -> {kode, progres, ulang}
+        self.guild_id = None
+        self.guild_pangkat = G.P_ANGGOTA
+        self.trade = None
+        self.pelanggaran = 0
+        self.terakhir_damage = []
+
+    # -------------------------------------------------------- inventori
+    def tambah_item(self, item_id, jumlah, plus=0):
+        """True bila berhasil, False bila tas penuh."""
+        for slot in range(G.INVENTORI_MAKS):
+            if slot not in self.inv:
+                self.inv[slot] = {"id": item_id, "jumlah": jumlah,
+                                  "plus": plus}
+                return True
+        return False
+
+    def buang_item(self, slot, jumlah):
+        it = self.inv.get(slot)
+        if it is None:
+            return
+        it["jumlah"] -= jumlah
+        if it["jumlah"] <= 0:
+            del self.inv[slot]
+
+    def sebagai_baris(self):
+        return {
+            "char_id": self.char_id,
+            "map_id": self.map_id,
+            "x": int(self.x),
+            "hp": self.hp,
+            "mp": self.mp,
+            "level": self.level,
+            "exp": self.exp,
+            "gold": self.gold,
+            "atk": self.atk,
+            "dfn": self.dfn,
+            "poin": self.poin,
+            "skill": self.skill,
+        }
+
+
+class Mob(object):
+    def __init__(self, mob_id, x, map_id):
+        self.eid = _next_eid()
+        self.mob_id = mob_id
+        self.info = G.MOB[mob_id]
+        self.hp = self.info["hp"]
+        self.hp_maks = self.info["hp"]
+        self.x = x
+        self.spawn_x = x
+        self.map_id = map_id
+        self.arah = 1
+        self.hidup = True
+        self.mati_pada = 0
+        self.target_eid = None
+        self.terakhir_serang = 0
+        self.kontribusi = {}   # eid -> total_damage untuk bagi exp
+
+    def reset(self):
+        self.hp = self.hp_maks
+        self.x = self.spawn_x
+        self.arah = 1
+        self.hidup = True
+        self.mati_pada = 0
+        self.target_eid = None
+        self.kontribusi = {}
 
 
 class Peta(object):
-    def __init__(self, map_id, info, dunia):
+    def __init__(self, map_id, info):
         self.map_id = map_id
         self.info = info
-        self.dunia = dunia
-        self.pemain = {}    # eid -> Pemain
-        self.mob = {}       # eid -> MobHidup
-        self.drop = {}      # did -> Drop
-        self._spawn_mob()
+        self.pemain = {}  # eid -> Pemain
+        self.mob = {}     # eid -> Mob
+        self.drop = {}    # did -> Drop
+        self._did = 0
 
-    def _spawn_mob(self):
-        rng = self.dunia.rng
-        for mob_id, jumlah in self.info["spawn"]:
+        for mob_id, jumlah in info["mob"]:
             for _ in range(jumlah):
-                x = rng.randint(120, self.info["lebar"] - 120)
-                eid = self.dunia.eid_baru()
-                self.mob[eid] = MobHidup(eid, mob_id, x, self.info["tanah"])
+                x = random.randint(200, G.LEBAR_MAP - 200)
+                m = Mob(mob_id, x, map_id)
+                self.mob[m.eid] = m
 
-    def sekitar(self, x, jarak=G.VIEW_RANGE):
-        return [p for p in self.pemain.values() if abs(p.x - x) <= jarak]
-
-
-class Dunia(object):
-    """Kumpulan peta + aturan main. Tidak tahu apa-apa soal socket."""
-
-    def __init__(self, seed=None, kirim=None):
-        self.rng = random.Random(seed)
-        self._eid = 1000
-        self._did = 1
-        self.peta = {}
-        self.pemain_by_char = {}
-        self.party = {}
-        self._party_id = 1
-        self._tid = 1
-        self.guild = {}          # gid -> dict guild
-        self.guild_by_nama = {}  # nama huruf kecil -> gid
-        self._gid = 0
-        self.guild_kotor = set()  # gid yang perlu ditulis ulang ke DB
-        self.guild_dihapus = set()  # gid yang harus dihapus dari DB
-        self.war = {}            # war_id -> dict perang
-        self.war_ajakan = {}     # gid tertantang -> dict(dari, taruhan, batas)
-        self._war_id = 0
-        self.kirim = kirim or (lambda pemain, opcode, isi: None)
-        self.kejadian = []      # log ringkas untuk selftest/debug
-        for map_id, info in G.MAP.items():
-            self.peta[map_id] = Peta(map_id, info, self)
-
-    # -------------------------------------------------------------- util
-    def eid_baru(self):
-        self._eid += 1
-        return self._eid
-
-    def did_baru(self):
+    def next_did(self):
         self._did += 1
         return self._did
 
-    def catat(self, *bagian):
-        self.kejadian.append(" ".join(str(b) for b in bagian))
-        if len(self.kejadian) > 500:
-            del self.kejadian[:250]
 
-    # ------------------------------------------------------------ masuk
+class Trade(object):
+    """Satu sesi dagang dua arah.
+
+    Protokol: ajak (0) -> terima (1) -> tawar (3) masing-masing sisi
+    -> kunci (4) keduanya -> eksekusi. Setiap perubahan
+    penawaran otomatis membuka kunci kedua pihak; dan isi tas dicek ulang
+    di saat terakhir supaya tidak ada manipulasi.
+    """
+
+    def __init__(self, trade_id, a, b):
+        self.id = trade_id
+        self.a = a
+        self.b = b
+        self.aktif = False    # True setelah kedua pihak setuju mulai
+        self.tawar = {
+            a.char_id: {"gold": 0, "item": []},
+            b.char_id: {"gold": 0, "item": []},
+        }
+        self.kunci = {a.char_id: False, b.char_id: False}
+
+
+class GuildData(object):
+    def __init__(self, baris):
+        self.gid = baris["id"]
+        self.nama = baris["nama"]
+        self.level = baris["level"]
+        self.exp = baris["exp"]
+        self.kas = baris["kas"]
+        self.anggota = {}  # char_id -> {nama, pangkat, online}
+        self.menang = baris.get("menang", 0)
+        self.kalah = baris.get("kalah", 0)
+        self.kotor = False
+        self.war_id = None
+
+
+class WarData(object):
+    def __init__(self, wid, guild_a, guild_b, taruhan, mulai_ms):
+        self.id = wid
+        self.guild_a = guild_a
+        self.guild_b = guild_b
+        self.taruhan = taruhan
+        self.mulai = mulai_ms
+        self.selesai = mulai_ms + G.WAR_DURASI_MS
+        self.skor = {guild_a.gid: 0, guild_b.gid: 0}
+
+
+class Dunia(object):
+    def __init__(self, seed=None):
+        self.rng = random.Random(seed)
+        self.peta = {mid: Peta(mid, info) for mid, info in G.MAP.items()}
+        self.pemain_by_char = {}  # char_id -> Pemain
+        self.guild = {}           # gid -> GuildData
+        self._war = {}            # wid -> WarData
+        self._trade_counter = 0
+        self._war_counter = 0
+
+    # --------------------------------------------------------- guild
+    def guild_muat(self, baris_list):
+        for b in baris_list:
+            g = GuildData(b)
+            for a in b.get("anggota", []):
+                g.anggota[a["char_id"]] = {
+                    "nama": a["nama"], "pangkat": a["pangkat"], "online": False
+                }
+            self.guild[g.gid] = g
+
+    def guild_anggota_online(self, g):
+        return [p for p in self.pemain_by_char.values()
+                if p.guild_id == g.gid]
+
+    def guild_pemain(self, pemain):
+        if pemain.guild_id is None:
+            return None
+        return self.guild.get(pemain.guild_id)
+
+    # --------------------------------------------------------- pemain
     def masuk(self, pemain):
         peta = self.peta[pemain.map_id]
         peta.pemain[pemain.eid] = pemain
         self.pemain_by_char[pemain.char_id] = pemain
-        pemain.y = peta.info["tanah"]
-        self.catat("masuk", pemain.nama, "map", pemain.map_id)
-        return peta
+        g = self.guild_pemain(pemain)
+        if g and pemain.char_id in g.anggota:
+            g.anggota[pemain.char_id]["online"] = True
 
     def keluar(self, pemain):
         peta = self.peta.get(pemain.map_id)
-        if peta and pemain.eid in peta.pemain:
-            del peta.pemain[pemain.eid]
+        if peta:
+            peta.pemain.pop(pemain.eid, None)
         self.pemain_by_char.pop(pemain.char_id, None)
-        if pemain.party:
-            self.party_keluar(pemain)
+        g = self.guild_pemain(pemain)
+        if g and pemain.char_id in g.anggota:
+            g.anggota[pemain.char_id]["online"] = False
         if pemain.trade:
             self.trade_batal(pemain, "lawan keluar")
-        self.catat("keluar", pemain.nama)
 
-    def pindah_map(self, pemain, tujuan, x):
-        if tujuan not in self.peta:
-            return False
+    def pindah_map(self, pemain, map_id, x):
+        peta_lama = self.peta[pemain.map_id]
+        peta_lama.pemain.pop(pemain.eid, None)
         if pemain.trade:
             self.trade_batal(pemain, "lawan pindah map")
-        lama = self.peta[pemain.map_id]
-        lama.pemain.pop(pemain.eid, None)
-        pemain.map_id = tujuan
+        pemain.map_id = map_id
         pemain.x = x
-        baru = self.peta[tujuan]
-        baru.pemain[pemain.eid] = pemain
-        pemain.y = baru.info["tanah"]
-        self.catat("pindah", pemain.nama, "ke", tujuan)
-        return True
+        pemain.y = G.TANAH_Y
+        peta_baru = self.peta[map_id]
+        peta_baru.pemain[pemain.eid] = pemain
 
-    # ------------------------------------------------------------ gerak
-    def gerak(self, pemain, x, arah, state):
-        """Validasi anti-speedhack: jarak per paket dibatasi kecepatan resmi."""
-        peta = self.peta[pemain.map_id]
-        x = max(0, min(int(x), peta.info["lebar"]))
-        skr = sekarang()
-        selisih_ms = max(1, skr - pemain.gerak_terakhir)
+    def cari_pemain(self, peta, eid):
+        return peta.pemain.get(eid)
+
+    # -------------------------------------------------------- aksi
+    def gerak(self, pemain, x, selisih_ms):
+        """Validasi gerak anti-speedhack. Mengembalikan x yang sah."""
         batas = (G.WALK_SPEED * G.RUN_TOLERANCE * selisih_ms) // G.TICK_MS + 24
+        x = max(0, min(int(x), G.LEBAR_MAP))
         if abs(x - pemain.x) > batas:
             pemain.pelanggaran += 1
-            self.catat("koreksi", pemain.nama, "lompat", abs(x - pemain.x))
-            return False
+            self.catat("koreksi", pemain.nama,
+                       "dari=%d ke=%d batas=%d" % (pemain.x, x, batas))
+            return pemain.x
         pemain.x = x
-        pemain.arah = 1 if arah >= 0 else -1
-        pemain.gerak_terakhir = skr
-        return True
+        return x
 
-    # ----------------------------------------------------------- tempur
     def _damage(self, atk, dfn, rng):
-        """Rumus damage: pengurangan proporsional + variasi 10 persen."""
         mentah = atk * 100 // (100 + max(0, dfn) * 3)
-        mentah = max(1, mentah)
-        variasi = rng.randint(-10, 10)
-        return max(1, mentah + mentah * variasi // 100)
+        variasi = mentah * rng.randint(-10, 10) // 100
+        return max(1, mentah + variasi)
 
     def serang(self, pemain, skill_id, target_eid):
-        if not pemain.hidup:
-            return "kamu sedang mati"
+        """(err, [(eid, dmg, hp_sisa)]). skill_id 0 = serangan biasa."""
         peta = self.peta[pemain.map_id]
-        skr = sekarang()
-        skill = None
-        if skill_id:
-            skill = G.SKILL.get(skill_id)
-            if skill is None or skill["job"] != pemain.job:
-                return "skill tidak dikenal"
-            lv = pemain.skill.get(str(skill_id), 0)
-            if lv <= 0:
-                return "skill belum dipelajari"
-            if pemain.cd.get(skill_id, 0) > skr:
-                return "skill masih cooldown"
-            if pemain.mp < skill["mp"]:
-                return "mp tidak cukup"
+        target = peta.mob.get(target_eid) or peta.pemain.get(target_eid)
+        if target is None or not target.hidup:
+            return "sasaran tidak ada", []
+        if not pemain.hidup:
+            return "kamu tumbang", []
 
-        korban = []
-        if skill and skill["tipe"] == 2:      # penyembuhan
-            pemain.mp -= skill["mp"]
-            pemain.cd[skill_id] = skr + skill["cd"]
-            lv = pemain.skill.get(str(skill_id), 1)
-            heal = skill["heal"] + skill["heal"] * G.SKILL_KENAIKAN * (lv - 1) // 100
-            pemain.hp = min(pemain.hp_maks, pemain.hp + heal)
-            self.catat("heal", pemain.nama, heal)
-            return None
-        if skill and skill["tipe"] == 3:      # buff
-            pemain.mp -= skill["mp"]
-            pemain.cd[skill_id] = skr + skill["cd"]
-            if "atk_persen" in skill:
-                pemain.buff["atk"] = (skr + skill["durasi"], skill["atk_persen"])
-            if "dfn_persen" in skill:
-                pemain.buff["dfn"] = (skr + skill["durasi"], skill["dfn_persen"])
-            pemain.hitung_stat()
-            self.catat("buff", pemain.nama, skill["nama"])
-            return None
-
-        if skill and skill["tipe"] == 1:      # area
-            radius = skill["radius"]
-            korban = [m for m in peta.mob.values()
-                      if m.hidup and abs(m.x - pemain.x) <= radius]
+        if skill_id == 0:
+            jarak_maks = (G.ATTACK_RANGE_RANGED
+                          if pemain.job == 3 else G.ATTACK_RANGE_MELEE)
+            if abs(int(pemain.x) - int(target.x)) > jarak_maks:
+                return "terlalu jauh", []
+            dmg = self._damage(pemain.atk, target.info["dfn"]
+                               if hasattr(target, "info")
+                               else target.dfn, self.rng)
+            target.hp = max(0, target.hp - dmg)
+            hasil = [(target.eid, dmg, target.hp)]
         else:
-            mob = peta.mob.get(target_eid)
-            if mob is None or not mob.hidup:
-                return "target tidak ada"
-            if abs(mob.x - pemain.x) > pemain.jarak + 12:
-                return "target terlalu jauh"
-            korban = [mob]
+            lv = int(pemain.skill.get(str(skill_id), 0))
+            if lv < 1:
+                return "skill belum dipelajari", []
+            s = G.SKILL.get(skill_id)
+            if not s or s["job"] != pemain.job:
+                return "skill tidak sesuai job", []
+            if pemain.mp < s["mp"]:
+                return "mp kurang", []
+            pemain.mp = max(0, pemain.mp - s["mp"])
+            daya = G.skill_daya_total(skill_id, lv, pemain.atk)
+            tipe = s["tipe"]
+            if tipe == 2:  # heal
+                heal = daya
+                pemain.hp = min(pemain.hp_maks, pemain.hp + heal)
+                hasil = [(pemain.eid, -heal, pemain.hp)]
+            elif tipe == 1:  # damage tunggal atau area
+                area = s.get("area", 0)
+                if area:
+                    sasaran = [e for e in list(peta.mob.values())
+                               + list(peta.pemain.values())
+                               if e.hidup and e.eid != pemain.eid
+                               and abs(int(e.x) - int(pemain.x)) <= area]
+                else:
+                    if abs(int(pemain.x) - int(target.x)) > s["jarak"]:
+                        return "terlalu jauh", []
+                    sasaran = [target]
+                hasil = []
+                for t in sasaran:
+                    dfn = t.info["dfn"] if hasattr(t, "info") else t.dfn
+                    dmg = self._damage(daya, dfn, self.rng)
+                    t.hp = max(0, t.hp - dmg)
+                    hasil.append((t.eid, dmg, t.hp))
+            else:  # buff (tipe 3)
+                hasil = [(pemain.eid, 0, pemain.hp)]
 
-        if skill:
-            pemain.mp -= skill["mp"]
-            pemain.cd[skill_id] = skr + skill["cd"]
-
-        hasil = []
-        for mob in korban:
-            atk = pemain.atk
-            if skill:
-                lv = pemain.skill.get(str(skill_id), 1)
-                persen = skill["dmg"] + G.SKILL_KENAIKAN * (lv - 1)
-                atk = atk * persen // 100
-            dmg = self._damage(atk, mob.info["dfn"], self.rng)
-            mob.hp -= dmg
-            mob.kontribusi[pemain.char_id] = mob.kontribusi.get(pemain.char_id, 0) + dmg
-            if mob.target is None:
-                mob.target = pemain.eid
-            hasil.append((mob.eid, dmg, max(0, mob.hp)))
-            if mob.hp <= 0:
-                self.mob_mati(peta, mob)
-        self.terakhir_damage = hasil
-        return None
+        pemain.terakhir_damage = hasil
+        for eid, dmg, hp_sisa in hasil:
+            obj = peta.mob.get(eid) or peta.pemain.get(eid)
+            if obj is None:
+                continue
+            if hasattr(obj, "kontribusi"):  # mob
+                obj.kontribusi[pemain.eid] = (
+                    obj.kontribusi.get(pemain.eid, 0) + max(0, dmg))
+                if hp_sisa == 0:
+                    ev = self.mob_mati(peta, obj)
+                    pemain.terakhir_damage = ev
+        return None, hasil
 
     def mob_mati(self, peta, mob):
         mob.hidup = False
         mob.mati_pada = sekarang()
-        info = mob.info
-        # exp dibagi ke penyumbang damage; party dapat bonus
-        total = sum(mob.kontribusi.values()) or 1
-        for char_id, dmg in mob.kontribusi.items():
-            pemain = self.pemain_by_char.get(char_id)
-            if pemain is None or pemain.map_id != peta.map_id:
+        hasil_drop = []
+        # bagi exp ke kontributor
+        total_kontrib = sum(mob.kontribusi.values()) or 1
+        dekat = [p for p in peta.pemain.values()
+                 if p.hidup and abs(int(p.x) - int(mob.x)) <= G.VIEW_RANGE]
+        penerima_exp = set(mob.kontribusi.keys()) | {p.eid for p in dekat}
+        for p_eid in penerima_exp:
+            p = peta.pemain.get(p_eid)
+            if p is None or not p.hidup:
                 continue
-            bagian = info["exp"] * dmg // total
-            bonus_exp = self.guild_bonus_persen(pemain, "exp")
-            bagian += bagian * bonus_exp // 100
-            anggota = self.party.get(pemain.party, {}).get("anggota", [])
-            dekat = [c for c in anggota
-                     if c in self.pemain_by_char
-                     and self.pemain_by_char[c].map_id == peta.map_id]
-            if len(dekat) > 1:
-                bagian = bagian * G.PARTY_BAGI_EXP // 100 // len(dekat)
-                for c in dekat:
-                    rekan = self.pemain_by_char[c]
-                    naik = rekan.beri_exp(bagian)
-                    if naik:
-                        self.catat("levelup", rekan.nama, rekan.level)
+            porsi = mob.kontribusi.get(p_eid, 0)
+            exp_base = mob.info["exp"] * porsi // total_kontrib
+            # bonus party
+            if p.eid in {pm.eid for pm in dekat}:
+                party_bonus = G.PARTY_BAGI_EXP
             else:
-                naik = pemain.beri_exp(bagian)
-                if naik:
-                    self.catat("levelup", pemain.nama, pemain.level)
-            emas = info["gold"] * dmg // total
-            bonus = self.guild_bonus_persen(pemain, "gold")
-            pemain.gold += emas + emas * bonus // 100
-            self.quest_bunuh(pemain, mob.mob_id)
-            self.war_bunuh(pemain, info.get("lv", 1))
-            for c in dekat:
-                if c != char_id and c in self.pemain_by_char:
-                    self.quest_bunuh(self.pemain_by_char[c], mob.mob_id)
+                party_bonus = 100
+            exp_base = exp_base * party_bonus // 100
+            # bonus guild
+            g = self.guild_pemain(p)
+            if g:
+                exp_base = exp_base * (100 + G.guild_bonus(g.level, "exp")) // 100
+                g.exp += exp_base * G.GUILD_EXP_PER_GOLD // 10  # kontribusi kecil
+                g.kotor = True
+                self.war_bunuh(p, mob.info["lv"])
+            self._beri_exp(p, exp_base)
         # drop
-        pemilik = max(mob.kontribusi, key=mob.kontribusi.get) if mob.kontribusi else 0
-        for item_id, peluang, jmin, jmaks in G.DROP.get(mob.mob_id, []):
-            if self.rng.randint(1, 10000) <= peluang:
-                jumlah = self.rng.randint(jmin, jmaks)
-                did = self.did_baru()
-                peta.drop[did] = Drop(did, item_id, jumlah, 0,
-                                      mob.x + self.rng.randint(-12, 12),
-                                      pemilik, sekarang())
-        self.catat("mob_mati", info["nama"], "oleh", pemilik)
+        gold_drop = mob.info["gold"] + self.rng.randint(
+            -mob.info["gold"] // 4, mob.info["gold"] // 4)
+        if gold_drop > 0:
+            d = Drop(peta.next_did(), 0, gold_drop, 0,
+                     mob.x + self.rng.randint(-20, 20))
+            peta.drop[d.did] = d
+            hasil_drop.append(d)
+        for item_id, pct in mob.info["drop"]:
+            if self.rng.randint(1, 100) <= pct:
+                d = Drop(peta.next_did(), item_id, 1, 0,
+                         mob.x + self.rng.randint(-20, 20))
+                peta.drop[d.did] = d
+                hasil_drop.append(d)
+        mob.kontribusi = {}
+        return [(mob.eid, 0, 0)] + [(d.did, d.item_id, d.jumlah)
+                                    for d in hasil_drop]
+
+    def _beri_exp(self, pemain, exp):
+        if not pemain.hidup or pemain.level >= G.LEVEL_MAKS:
+            return
+        pemain.exp += exp
+        while pemain.level < G.LEVEL_MAKS:
+            butuh = G.exp_untuk(pemain.level)
+            if butuh == 0 or pemain.exp < butuh:
+                break
+            pemain.exp -= butuh
+            pemain.level += 1
+            hp_maks, mp_maks, atk, dfn = G.stat_dasar(pemain.level, pemain.job)
+            pemain.hp_maks = hp_maks
+            pemain.mp_maks = mp_maks
+            pemain.atk = atk
+            pemain.dfn = dfn
+            pemain.poin += G.SKILL_KENAIKAN
+            pemain.hp = pemain.hp_maks
+            pemain.mp = pemain.mp_maks
 
     def ambil_drop(self, pemain, did):
         peta = self.peta[pemain.map_id]
         d = peta.drop.get(did)
         if d is None:
-            return "barang sudah diambil"
-        if abs(d.x - pemain.x) > 48:
+            return "barang tidak ada"
+        if abs(int(pemain.x) - int(d.x)) > 48:
             return "terlalu jauh"
-        umur = sekarang() - d.waktu
-        if d.pemilik and d.pemilik != pemain.char_id and umur < 10000:
-            return "barang masih milik penjatuh"
-        if not pemain.tambah_item(d.item_id, d.jumlah, d.plus):
-            return "inventori penuh"
+        skr = sekarang()
+        if d.pemilik_id and d.pemilik_id != pemain.eid:
+            if skr - d.waktu < 10000:
+                return "barang ini milik orang lain dulu"
+        if d.item_id == 0:  # gold
+            g = self.guild_pemain(pemain)
+            bonus = G.guild_bonus(g.level, "gold") if g else 0
+            pemain.gold += d.jumlah * (100 + bonus) // 100
+        else:
+            if not pemain.tambah_item(d.item_id, d.jumlah, d.plus):
+                return "tas penuh"
         del peta.drop[did]
         return None
 
-    # -------------------------------------------------------- equipment
-    def pakai_equip(self, pemain, slot):
-        it = pemain.inv.get(slot)
-        if not it:
-            return "slot kosong"
-        info = G.ITEM.get(it["id"])
-        if not info or info["jenis"] not in G.SLOT_EQUIP:
-            return "item ini tidak bisa dipakai"
-        if info.get("lv", 1) > pemain.level:
-            return "level belum cukup"
-        if info["jenis"] == 1 and info.get("job") != pemain.job:
-            return "senjata ini bukan untuk job kamu"
-        tujuan = G.SLOT_EQUIP[info["jenis"]]
-        lama = pemain.eq.get(tujuan)
-        del pemain.inv[slot]
-        pemain.eq[tujuan] = it
-        if lama:
-            pemain.inv[slot] = lama
-        pemain.hitung_stat()
-        return None
-
-    def lepas_equip(self, pemain, slot_equip):
-        it = pemain.eq.get(slot_equip)
-        if not it:
-            return "tidak ada yang dipakai"
-        kosong = pemain.slot_kosong()
-        if kosong < 0:
-            return "inventori penuh"
-        del pemain.eq[slot_equip]
-        pemain.inv[kosong] = it
-        pemain.hitung_stat()
-        return None
-
-    def upgrade(self, pemain, slot_equip):
-        it = pemain.eq.get(slot_equip)
-        if not it:
-            return "tidak ada yang dipakai di slot itu", 0
-        plus = it.get("plus", 0)
-        if plus >= G.UPGRADE_MAKS:
-            return "sudah maksimal", 0
-        butuh = G.UPGRADE_BATU[plus]
-        if not pemain.punya_item(600, butuh):
-            return "butuh %d Batu Tempa" % butuh, 0
-        pemain.pakai_bahan(600, butuh)
-        peluang = G.UPGRADE_PELUANG[plus]
-        if self.rng.randint(1, 100) <= peluang:
-            it["plus"] = plus + 1
-            pemain.hitung_stat()
-            self.catat("upgrade_sukses", pemain.nama, it["id"], it["plus"])
-            return None, it["plus"]
-        self.catat("upgrade_gagal", pemain.nama, it["id"], plus)
-        return "gagal, batu hangus", plus
-
-    # -------------------------------------------------------- consumable
     def pakai_item(self, pemain, slot):
         it = pemain.inv.get(slot)
-        if not it:
+        if it is None:
             return "slot kosong"
         info = G.ITEM.get(it["id"])
-        if not info or info["jenis"] != 0:
-            return "item ini tidak bisa diminum"
-        if info.get("teleport"):
-            self.pindah_map(pemain, G.MAP_AWAL, G.SPAWN_AWAL_X)
-        if info.get("hp"):
-            pemain.hp = min(pemain.hp_maks, pemain.hp + info["hp"])
-        if info.get("mp"):
-            pemain.mp = min(pemain.mp_maks, pemain.mp + info["mp"])
+        if info is None or info["jenis"] != "potion":
+            return "bukan potion"
+        if not pemain.hidup:
+            return "kamu tumbang"
+        pemain.hp = min(pemain.hp_maks,
+                        pemain.hp + info.get("hp", 0))
+        pemain.mp = min(pemain.mp_maks,
+                        pemain.mp + info.get("mp", 0))
         pemain.buang_item(slot, 1)
         return None
 
-    # ------------------------------------------------------------- toko
-    def beli(self, pemain, item_id, jumlah):
-        if item_id not in G.TOKO:
-            return "barang tidak dijual"
-        jumlah = max(1, min(int(jumlah), 99))
-        harga = G.ITEM[item_id]["harga"] * jumlah
-        if pemain.gold < harga:
-            return "gold tidak cukup"
-        if not pemain.tambah_item(item_id, jumlah):
-            return "inventori penuh"
-        pemain.gold -= harga
-        return None
-
-    def jual(self, pemain, slot, jumlah):
-        it = pemain.inv.get(slot)
-        if not it:
+    def pakai_equip(self, pemain, slot_tas):
+        it = pemain.inv.get(slot_tas)
+        if it is None:
             return "slot kosong"
-        jumlah = max(1, min(int(jumlah), it["jumlah"]))
-        info = G.ITEM[it["id"]]
-        harga = info["harga"] * jumlah // 4    # jual = 25 persen harga beli
-        pemain.buang_item(slot, jumlah)
-        pemain.gold += harga
+        info = G.ITEM.get(it["id"])
+        if info is None or "slot" not in info:
+            return "barang ini tidak bisa diequip"
+        if info.get("job") is not None and info["job"] != pemain.job:
+            return "tidak sesuai job"
+        slot_eq = info["slot"]
+        # tanggalkan dulu kalau ada
+        if slot_eq in pemain.eq:
+            lama = pemain.eq.pop(slot_eq)
+            pemain.tambah_item(lama["id"], lama["jumlah"], lama.get("plus", 0))
+        eq_item = pemain.inv.pop(slot_tas)
+        pemain.eq[slot_eq] = eq_item
+        self._hitung_stat(pemain)
         return None
 
-    # ------------------------------------------------------------ skill
+    def lepas_equip(self, pemain, slot_eq):
+        it = pemain.eq.get(slot_eq)
+        if it is None:
+            return "slot equip kosong"
+        if not pemain.tambah_item(it["id"], it["jumlah"], it.get("plus", 0)):
+            return "tas penuh"
+        del pemain.eq[slot_eq]
+        self._hitung_stat(pemain)
+        return None
+
+    def _hitung_stat(self, pemain):
+        hp_maks, mp_maks, atk, dfn = G.stat_dasar(pemain.level, pemain.job)
+        for it in pemain.eq.values():
+            atk += G.item_atk(it["id"], it.get("plus", 0))
+            dfn += G.item_dfn(it["id"], it.get("plus", 0))
+        pemain.hp_maks = hp_maks
+        pemain.mp_maks = mp_maks
+        pemain.atk = atk
+        pemain.dfn = dfn
+        pemain.hp = min(pemain.hp, pemain.hp_maks)
+        pemain.mp = min(pemain.mp, pemain.mp_maks)
+
+    def upgrade(self, pemain, slot):
+        it = pemain.inv.get(slot)
+        if it is None:
+            return "slot kosong", False
+        if G.ITEM.get(it["id"], {}).get("jenis") not in (
+                "senjata", "baju", "topi", "sayap"):
+            return "barang ini tidak bisa di-upgrade", False
+        plus = it.get("plus", 0)
+        # cari batu tempa di inventori
+        batu_slot = next(
+            (s for s, b in pemain.inv.items()
+             if b["id"] == 600), None)
+        if batu_slot is None:
+            return "perlu Batu Tempa", False
+        pemain.buang_item(batu_slot, 1)
+        if self.rng.random() < G.upgrade_peluang(plus):
+            it["plus"] = plus + 1
+            self._hitung_stat(pemain)
+            return None, True
+        return "gagal, batu hangus", False
+
+    def toko_beli(self, pemain, item_id, jumlah, map_id):
+        toko = G.MAP.get(map_id, {}).get("toko", [])
+        if item_id not in toko:
+            return "barang tidak dijual di sini"
+        info = G.ITEM.get(item_id)
+        if info is None:
+            return "barang tidak dikenal"
+        total = info["harga"] * jumlah
+        if pemain.gold < total:
+            return "gold kurang"
+        if not pemain.tambah_item(item_id, jumlah, 0):
+            return "tas penuh"
+        pemain.gold -= total
+        return None
+
+    def toko_jual(self, pemain, slot, jumlah):
+        it = pemain.inv.get(slot)
+        if it is None or jumlah < 1 or it["jumlah"] < jumlah:
+            return "slot tidak valid", 0
+        info = G.ITEM.get(it["id"])
+        if info is None:
+            return "barang tidak dikenal", 0
+        bayar = info["harga"] * jumlah // 4
+        pemain.buang_item(slot, jumlah)
+        pemain.gold += bayar
+        return None, bayar
+
+    def quest_bicara_npc(self, pemain, npc_idx):
+        peta_info = G.MAP.get(pemain.map_id, {})
+        npc = peta_info.get("npc", [])
+        if npc_idx >= len(npc):
+            return "npc tidak ada", []
+        nx, _, jenis = npc[npc_idx]
+        if abs(int(pemain.x) - nx) > 90:
+            return "terlalu jauh dari NPC", []
+        daftar = []
+        for qid, q in G.QUEST.items():
+            npc_map, npc_i = q["npc"]
+            if npc_map != pemain.map_id or npc_i != npc_idx:
+                continue
+            st = pemain.quest.get(qid, {})
+            kode = self._kode_quest(pemain, qid, st)
+            if kode != 4:  # tampilkan semua kecuali yang terkunci level
+                daftar.append((qid, kode, st.get("progres", 0),
+                               q["butuh"]))
+        return None, daftar
+
+    def quest_ambil(self, pemain, qid):
+        q = G.QUEST.get(qid)
+        if q is None:
+            return "quest tidak ada"
+        kode = self._kode_quest(pemain, qid, pemain.quest.get(qid, {}))
+        if kode != 0:
+            return "quest tidak bisa diambil sekarang"
+        pemain.quest[qid] = {"kode": 1, "progres": 0, "ulang": 0}
+        return None
+
+    def quest_serah(self, pemain, qid):
+        q = G.QUEST.get(qid)
+        st = pemain.quest.get(qid)
+        if q is None or st is None or st["kode"] != 2:
+            return "quest belum selesai"
+        if q["jenis"] == 1:  # harus bawa item
+            slot_item = next(
+                (s for s, it in pemain.inv.items()
+                 if it["id"] == q["sasaran"] and it["jumlah"] >= q["butuh"]),
+                None)
+            if slot_item is None:
+                return "item belum cukup"
+            pemain.buang_item(slot_item, q["butuh"])
+        pemain.gold += q["hadiah_gold"]
+        self._beri_exp(pemain, q["hadiah_exp"])
+        # hadiah senjata tier 2/3 dari quest 20/21
+        if q.get("hadiah_item"):
+            tier = 1 if qid == 20 else 2
+            senjata_id = {0: 200, 1: 210, 2: 220, 3: 230}[pemain.job] + tier
+            pemain.tambah_item(senjata_id, 1, 0)
+        if qid in G.QUEST_ULANG:
+            st["kode"] = 0
+            st["progres"] = 0
+            st["ulang"] = st.get("ulang", 0) + 1
+        else:
+            st["kode"] = 3
+        return None
+
+    def quest_batal(self, pemain, qid):
+        st = pemain.quest.get(qid)
+        if st is None or st["kode"] not in (1, 2):
+            return "quest tidak aktif"
+        del pemain.quest[qid]
+        return None
+
+    def _kode_quest(self, pemain, qid, st):
+        """0 baru, 1 jalan, 2 siap, 3 selesai, 4 terkunci."""
+        if st.get("kode") is not None:
+            return st["kode"]
+        q = G.QUEST[qid]
+        if pemain.level < q["lv"]:
+            return 4
+        if qid in G.QUEST_RANTAI:
+            idx = G.QUEST_RANTAI.index(qid)
+            if idx > 0:
+                prev_st = pemain.quest.get(G.QUEST_RANTAI[idx - 1], {})
+                if prev_st.get("kode") != 3:
+                    return 4
+        return 0
+
+    def quest_update_progres(self, pemain, jenis, sasaran, jumlah=1):
+        """Dipanggil saat mob mati (jenis 0) atau item diambil (jenis 1)."""
+        naik = []
+        for qid, st in list(pemain.quest.items()):
+            if st.get("kode") != 1:
+                continue
+            q = G.QUEST.get(qid)
+            if not q or q["jenis"] != jenis or q["sasaran"] != sasaran:
+                continue
+            st["progres"] = min(st["progres"] + jumlah, q["butuh"])
+            if st["progres"] >= q["butuh"]:
+                st["kode"] = 2
+            naik.append(qid)
+        return naik
+
+    def _dekat_npc(self, pemain, jenis):
+        info = G.MAP.get(pemain.map_id, {})
+        for nx, _, nj in info.get("npc", []):
+            if nj == jenis and abs(int(pemain.x) - nx) <= 90:
+                return True
+        return False
+
     def naik_skill(self, pemain, skill_id):
-        skill = G.SKILL.get(skill_id)
-        if not skill or skill["job"] != pemain.job:
-            return "skill tidak dikenal"
-        if pemain.level < skill["lv_min"]:
-            return "level belum cukup"
-        if pemain.poin <= 0:
+        if pemain.poin < 1:
             return "tidak ada poin skill"
+        s = G.SKILL.get(skill_id)
+        if s is None:
+            return "skill tidak ada"
+        if s["job"] != pemain.job:
+            return "skill bukan untuk job kamu"
         kunci = str(skill_id)
         lv = pemain.skill.get(kunci, 0)
         if lv >= G.SKILL_LEVEL_MAKS:
@@ -612,205 +658,41 @@ class Dunia(object):
         return None
 
     # ------------------------------------------------------------ party
-    def party_buat(self, pemain):
-        if pemain.party:
-            return "kamu sudah punya party"
-        pid = self._party_id
-        self._party_id += 1
-        self.party[pid] = dict(id=pid, ketua=pemain.char_id,
-                               anggota=[pemain.char_id])
-        pemain.party = pid
-        return None
-
-    def party_masuk(self, pemain, pid):
-        p = self.party.get(pid)
-        if not p:
-            return "party tidak ada"
-        if pemain.party:
-            return "kamu sudah punya party"
-        if len(p["anggota"]) >= G.PARTY_MAKS:
-            return "party penuh"
-        p["anggota"].append(pemain.char_id)
-        pemain.party = pid
-        return None
-
-    def party_keluar(self, pemain):
-        pid = pemain.party
-        p = self.party.get(pid)
-        pemain.party = None
-        if not p:
-            return None
-        if pemain.char_id in p["anggota"]:
-            p["anggota"].remove(pemain.char_id)
-        if not p["anggota"]:
-            del self.party[pid]
-        elif p["ketua"] == pemain.char_id:
-            p["ketua"] = p["anggota"][0]
-        return None
-
-    # ------------------------------------------------------------ quest
-    def quest_progres(self, pemain, qid):
-        """(progres sekarang, jumlah yang dibutuhkan).
-
-        Quest kumpul dihitung langsung dari isi tas supaya tidak bisa
-        dicurangi: yang dihitung isi tas saat ini, bukan angka yang
-        pernah dikirim client.
-        """
-        q = G.QUEST[qid]
-        butuh = q["jumlah"]
-        if q["jenis"] == 1:
-            punya = sum(it["jumlah"] for it in pemain.inv.values()
-                        if it["id"] == q["sasaran"])
-            return min(punya, butuh), butuh
-        st = pemain.quest.get(qid)
-        return (min(st["progres"], butuh) if st else 0), butuh
-
-    def quest_kode(self, pemain, qid):
-        """Kode status untuk client: 0 bisa ambil, 1 jalan, 2 siap serah,
-        3 sudah selesai, 4 syarat belum terpenuhi."""
-        q = G.QUEST[qid]
-        st = pemain.quest.get(qid)
-        if st and st["status"] != G.Q_SELESAI:
-            progres, butuh = self.quest_progres(pemain, qid)
-            return 2 if progres >= butuh else 1
-        if st and st["status"] == G.Q_SELESAI and not q.get("ulang"):
-            return 3
-        if pemain.level < q["lv"]:
-            return 4
-        butuh_q = q["butuh"]
-        if butuh_q:
-            sebelum = pemain.quest.get(butuh_q)
-            if not sebelum or sebelum["status"] != G.Q_SELESAI:
-                return 4
-        return 0
-
-    def quest_aktif(self, pemain):
-        return [qid for qid, st in pemain.quest.items()
-                if st["status"] != G.Q_SELESAI]
-
-    def quest_daftar_npc(self, pemain, map_id, npc_idx):
-        keluar = []
-        for qid in G.quest_npc(map_id, npc_idx):
-            kode = self.quest_kode(pemain, qid)
-            progres, butuh = self.quest_progres(pemain, qid)
-            keluar.append((qid, kode, progres, butuh))
-        return keluar
-
-    def _dekat_npc(self, pemain, qid):
-        map_id, idx = G.QUEST[qid]["npc"]
-        if pemain.map_id != map_id:
-            return False
-        npc = self.peta[map_id].info["npc"]
-        if idx >= len(npc):
-            return False
-        return abs(pemain.x - npc[idx][0]) <= 90
-
-    def quest_ambil(self, pemain, qid):
-        q = G.QUEST.get(qid)
-        if not q:
-            return "quest tidak ada"
-        if not self._dekat_npc(pemain, qid):
-            return "kamu jauh dari NPC-nya"
-        kode = self.quest_kode(pemain, qid)
-        if kode == 3:
-            return "quest ini sudah selesai"
-        if kode == 4:
-            return "syarat belum terpenuhi"
-        if kode in (1, 2):
-            return "quest ini sedang berjalan"
-        if len(self.quest_aktif(pemain)) >= G.QUEST_AKTIF_MAKS:
-            return "quest aktif sudah %d" % G.QUEST_AKTIF_MAKS
-        lama = pemain.quest.get(qid) or {}
-        pemain.quest[qid] = dict(status=G.Q_AKTIF, progres=0,
-                                 kali=lama.get("kali", 0))
-        self.catat("quest_ambil", pemain.nama, qid)
-        return None
-
-    def quest_batal(self, pemain, qid):
-        st = pemain.quest.get(qid)
-        if not st or st["status"] == G.Q_SELESAI:
-            return "quest itu tidak sedang berjalan"
-        if st.get("kali", 0) > 0:
-            st["status"] = G.Q_SELESAI
-            st["progres"] = 0
-        else:
-            del pemain.quest[qid]
-        self.catat("quest_batal", pemain.nama, qid)
-        return None
-
-    def quest_bunuh(self, pemain, mob_id):
-        """Dipanggil setiap mob mati untuk tiap pemain yang berhak."""
-        for qid, st in pemain.quest.items():
-            if st["status"] != G.Q_AKTIF:
-                continue
-            q = G.QUEST.get(qid)
-            if not q or q["jenis"] != 0 or q["sasaran"] != mob_id:
-                continue
-            if st["progres"] < q["jumlah"]:
-                st["progres"] += 1
-
-    def quest_serah(self, pemain, qid):
-        q = G.QUEST.get(qid)
-        if not q:
-            return "quest tidak ada", None
-        st = pemain.quest.get(qid)
-        if not st or st["status"] == G.Q_SELESAI:
-            return "quest itu tidak sedang berjalan", None
-        if not self._dekat_npc(pemain, qid):
-            return "lapor langsung ke NPC-nya", None
-        progres, butuh = self.quest_progres(pemain, qid)
-        if progres < butuh:
-            return "syarat belum lengkap (%d/%d)" % (progres, butuh), None
-        hadiah = G.hadiah_item(qid, pemain.job)
-        kosong = sum(1 for s in range(G.INVENTORI_MAKS) if s not in pemain.inv)
-        if q["jenis"] == 1:
-            kosong += 1          # slot bahan yang bakal ikut kosong
-        if len(hadiah) > kosong:
-            return "kosongkan dulu tasmu", None
-        if q["jenis"] == 1:
-            pemain.pakai_bahan(q["sasaran"], butuh)
-        naik = pemain.beri_exp(q["exp"])
-        pemain.gold += q["gold"]
-        for item_id, jumlah in hadiah:
-            pemain.tambah_item(item_id, jumlah)
-        st["status"] = G.Q_SELESAI
-        st["progres"] = 0
-        st["kali"] = st.get("kali", 0) + 1
-        self.catat("quest_selesai", pemain.nama, qid)
-        return None, dict(nama=q["nama"], teks=q["selesai"], exp=q["exp"],
-                          gold=q["gold"], item=hadiah, naik=naik,
-                          berikut=q.get("berikut", 0))
+    def party_ajak(self, pemain, target_eid):
+        peta = self.peta[pemain.map_id]
+        target = peta.pemain.get(target_eid)
+        if target is None:
+            return "pemain tidak ada di sini", None
+        if pemain.eid == target.eid:
+            return "tidak bisa mengajak diri sendiri", None
+        return None, target
 
     # ------------------------------------------------------------ trade
     def _trade_id(self):
-        self._tid += 1
-        return self._tid
+        self._trade_counter += 1
+        return self._trade_counter
 
     def trade_ajak(self, pemain, target_eid):
         if pemain.trade:
             return "kamu sedang berdagang", None
         peta = self.peta[pemain.map_id]
-        lawan = peta.pemain.get(target_eid)
-        if lawan is None or lawan.eid == pemain.eid:
-            return "pemain itu tidak ada di sini", None
-        if lawan.trade:
-            return "dia sedang berdagang", None
-        if not pemain.hidup or not lawan.hidup:
+        target = peta.pemain.get(target_eid)
+        if target is None:
+            return "pemain tidak ada", None
+        if not pemain.hidup:
             return "tidak bisa berdagang sambil tumbang", None
-        if abs(pemain.x - lawan.x) > G.TRADE_JARAK:
-            return "terlalu jauh, dekati dulu", None
-        t = Trade(self._trade_id(), pemain, lawan)
+        if target.trade:
+            return "dia sedang berdagang", None
+        t = Trade(self._trade_id(), pemain, target)
         pemain.trade = t
-        lawan.trade = t
-        self.catat("trade_ajak", pemain.nama, lawan.nama)
+        target.trade = t
+        self.catat("trade_ajak", pemain.nama, target.nama)
         return None, t
 
     def trade_terima(self, pemain):
         t = pemain.trade
-        if not t:
+        if t is None:
             return "tidak ada ajakan dagang", None
-        if t.b.char_id != pemain.char_id:
-            return "kamu yang mengajak, tunggu jawabannya", None
         if t.aktif:
             return "dagang sudah dimulai", None
         t.aktif = True
@@ -819,47 +701,36 @@ class Dunia(object):
 
     def trade_batal(self, pemain, alasan="dibatalkan"):
         t = pemain.trade
-        if not t:
-            return None, None, alasan
+        if t is None:
+            return
         t.a.trade = None
         t.b.trade = None
         self.catat("trade_batal", t.a.nama, t.b.nama, alasan)
-        return t.a, t.b, alasan
 
     def trade_tawar(self, pemain, gold, daftar):
         """daftar = [(slot, jumlah)]. Setiap perubahan membuka kunci kedua
-        pihak, jadi isi tidak bisa diganti diam-diam setelah lawan setuju."""
+        pihak supaya tidak ada manipulasi di detik terakhir."""
         t = pemain.trade
-        if not t or not t.aktif:
+        if t is None or not t.aktif:
             return "tidak sedang berdagang", None
-        gold = int(gold)
         if gold < 0 or gold > G.TRADE_GOLD_MAKS:
             return "jumlah gold tidak masuk akal", None
         if gold > pemain.gold:
             return "gold kamu tidak cukup", None
         if len(daftar) > G.TRADE_SLOT_MAKS:
-            return "maksimal %d barang" % G.TRADE_SLOT_MAKS, None
-        dipakai = set()
-        bersih = []
+            return "terlalu banyak barang", None
         for slot, jumlah in daftar:
             it = pemain.inv.get(slot)
-            if not it:
-                return "slot %d kosong" % slot, None
-            if slot in dipakai:
-                return "slot dobel", None
-            jumlah = int(jumlah)
-            if jumlah < 1 or jumlah > it["jumlah"]:
-                return "jumlah barang tidak valid", None
-            dipakai.add(slot)
-            bersih.append((slot, jumlah))
-        t.tawar[pemain.char_id] = dict(gold=gold, item=bersih)
+            if not it or jumlah < 1 or it["jumlah"] < jumlah:
+                return "slot tas tidak valid", None
+        t.tawar[pemain.char_id] = {"gold": gold, "item": daftar}
         t.kunci[t.a.char_id] = False
         t.kunci[t.b.char_id] = False
         return None, t
 
     def trade_kunci(self, pemain):
         t = pemain.trade
-        if not t or not t.aktif:
+        if t is None or not t.aktif:
             return "tidak sedang berdagang", None, False
         t.kunci[pemain.char_id] = True
         if not (t.kunci[t.a.char_id] and t.kunci[t.b.char_id]):
@@ -907,10 +778,13 @@ class Dunia(object):
         for pengirim, penerima in ((a, b), (b, a)):
             for item_id, jumlah, plus in paket[pengirim.char_id]:
                 penerima.tambah_item(item_id, jumlah, plus)
-            penerima.gold += t.tawar[pengirim.char_id]["gold"]
+            gold_masuk = t.tawar[pengirim.char_id]["gold"]
+            pajak = max(0, gold_masuk * G.TRADE_PAJAK_PERSEN // 100)
+            penerima.gold += gold_masuk - pajak
         self.catat("trade_sukses", a.nama, b.nama,
                    "%dg" % t.tawar[a.char_id]["gold"],
-                   "%dg" % t.tawar[b.char_id]["gold"])
+                   "%dg" % t.tawar[b.char_id]["gold"],
+                   "pajak=%d%%" % G.TRADE_PAJAK_PERSEN)
         return None
 
     # ------------------------------------------------------------- tick
@@ -939,421 +813,311 @@ class Dunia(object):
                 if not pemain.hidup:
                     if skr - pemain.mati_pada >= G.RESPAWN_PLAYER_MS:
                         pemain.hidup = True
-                        pemain.hp = pemain.hp_maks // 2
-                        pemain.mp = pemain.mp_maks // 2
-                        self.pindah_map(pemain, G.MAP_AWAL, G.SPAWN_AWAL_X)
+                        pemain.hp = pemain.hp_maks
+                        pemain.mp = pemain.mp_maks
                         peristiwa.append(("hidup_lagi", peta.map_id, pemain))
                     continue
-                if pemain.hp < pemain.hp_maks:
-                    pemain.hp = min(pemain.hp_maks, pemain.hp + 1 + pemain.level // 8)
-                if pemain.mp < pemain.mp_maks:
-                    pemain.mp = min(pemain.mp_maks, pemain.mp + 1 + pemain.level // 12)
-                if pemain.buff:
-                    pemain.hitung_stat()
-        for hasil in self.war_tick():
-            peristiwa.append(("war_selesai", 0, hasil))
+                regen_hp = 1 + pemain.level // 8
+                regen_mp = 1 + pemain.level // 12
+                pemain.hp = min(pemain.hp_maks, pemain.hp + regen_hp)
+                pemain.mp = min(pemain.mp_maks, pemain.mp + regen_mp)
+        # periksa war
+        peristiwa += self._cek_war(skr)
         return peristiwa
 
     def _ai_mob(self, peta, mob, skr, peristiwa):
+        # cari target terdekat
         target = None
-        if mob.target:
-            target = peta.pemain.get(mob.target)
-            if target is None or not target.hidup or abs(target.x - mob.x) > G.AGGRO_RANGE * 2:
-                mob.target = None
+        jarak_t = G.AGGRO_RANGE
+        if mob.target_eid:
+            target = peta.pemain.get(mob.target_eid)
+            if target and (not target.hidup
+                           or abs(int(target.x) - int(mob.x)) > G.VIEW_RANGE):
                 target = None
+                mob.target_eid = None
         if target is None:
-            dekat = [p for p in peta.pemain.values()
-                     if p.hidup and abs(p.x - mob.x) <= G.AGGRO_RANGE]
-            if dekat:
-                target = min(dekat, key=lambda p: abs(p.x - mob.x))
-                mob.target = target.eid
+            for p in peta.pemain.values():
+                if not p.hidup:
+                    continue
+                d = abs(int(p.x) - int(mob.x))
+                if d < jarak_t:
+                    jarak_t = d
+                    target = p
+            if target:
+                mob.target_eid = target.eid
         if target is None:
-            # patroli pelan balik ke rumah
-            if abs(mob.x - mob.rumah_x) > 4:
-                mob.x += 1 if mob.rumah_x > mob.x else -1
             return
-        jarak = abs(target.x - mob.x)
-        mob.arah = 1 if target.x > mob.x else -1
-        if jarak > mob.info["jarak"]:
-            mob.x += mob.info["speed"] * mob.arah
+        # gerak
+        dx = int(target.x) - int(mob.x)
+        if abs(dx) > G.ATTACK_RANGE_MELEE:
+            mob.arah = 1 if dx > 0 else -1
+            mob.x = max(0, min(G.LEBAR_MAP,
+                               mob.x + mob.arah * G.WALK_SPEED))
             peristiwa.append(("mob_gerak", peta.map_id, mob))
-            return
-        if skr < mob.serang_pada:
-            return
-        mob.serang_pada = skr + 1200
-        dmg = self._damage(mob.info["atk"], target.dfn, self.rng)
-        target.hp -= dmg
-        peristiwa.append(("mob_serang", peta.map_id, mob, target, dmg))
-        if target.hp <= 0:
-            target.hp = 0
-            target.hidup = False
-            target.mati_pada = skr
-            hilang = target.gold // 20
-            target.gold -= hilang
-            mob.target = None
-            peristiwa.append(("pemain_mati", peta.map_id, target, hilang))
-            self.catat("pemain_mati", target.nama, "oleh", mob.info["nama"])
+        # serang
+        if (abs(dx) <= G.ATTACK_RANGE_MELEE
+                and skr - mob.terakhir_serang >= 1200):
+            mob.terakhir_serang = skr
+            dmg = self._damage(mob.info["atk"], target.dfn, self.rng)
+            target.hp = max(0, target.hp - dmg)
+            peristiwa.append(("mob_serang", peta.map_id, mob, target, dmg))
+            if target.hp == 0 and target.hidup:
+                target.hidup = False
+                target.mati_pada = skr
+                hilang = target.gold // 20
+                target.gold = max(0, target.gold - hilang)
+                peristiwa.append(("pemain_mati", peta.map_id, target, hilang))
 
     # ------------------------------------------------------------ guild
-    # Guild disimpan di memori (dict) dan dicerminkan ke DB oleh app.py
-    # lewat set `guild_kotor`: setiap perubahan menandai gid yang harus
-    # ditulis ulang. Selftest bisa memakai semua ini tanpa DB sama sekali.
-
-    def _gid_baru(self):
-        self._gid += 1
-        return self._gid
-
-    def guild_tandai(self, gid):
-        self.guild_kotor.add(gid)
-
-    def guild_muat(self, baris):
-        """Isi ulang dari DB saat boot. baris = list dict ala db.muat_guild_semua."""
-        for g in baris:
-            g = dict(g)
-            g.setdefault("anggota", {})
-            g["anggota"] = dict((int(k), dict(v)) for k, v in g["anggota"].items())
-            g.setdefault("menang", 0)
-            g.setdefault("kalah", 0)
-            g.setdefault("war_akhir", 0)
-            self.guild[g["id"]] = g
-            self.guild_by_nama[g["nama"].lower()] = g["id"]
-            self._gid = max(self._gid, g["id"])
-
-    def guild_dari(self, pemain):
-        return self.guild.get(pemain.guild) if pemain.guild else None
-
-    def guild_pangkat(self, pemain):
-        g = self.guild_dari(pemain)
-        if not g:
-            return -1
-        a = g["anggota"].get(pemain.char_id)
-        return a["pangkat"] if a else -1
-
-    def guild_bonus_persen(self, pemain, jenis):
-        g = self.guild_dari(pemain)
-        if not g:
-            return 0
-        return G.guild_bonus(g["level"], jenis)
-
-    def guild_buat(self, pemain, nama):
-        nama = (nama or "").strip()
-        if pemain.guild:
+    def guild_buat(self, pemain, nama, con=None):
+        import db as DB
+        nama = nama.strip()
+        if len(nama) < G.GUILD_NAMA_MIN or len(nama) > G.GUILD_NAMA_MAKS:
+            return "nama guild %d-%d karakter" % (
+                G.GUILD_NAMA_MIN, G.GUILD_NAMA_MAKS), None
+        if pemain.guild_id:
             return "kamu sudah punya guild", None
-        if not G.GUILD_NAMA_MIN <= len(nama) <= G.GUILD_NAMA_MAKS:
-            return "nama guild %d-%d huruf" % (G.GUILD_NAMA_MIN,
-                                               G.GUILD_NAMA_MAKS), None
-        for ch in nama:
-            if not (ch.isalnum() or ch in " _"):
-                return "nama guild hanya huruf, angka, spasi, garis bawah", None
-        if nama.lower() in self.guild_by_nama:
-            return "nama guild sudah dipakai", None
         if pemain.gold < G.GUILD_BIAYA_BUAT:
-            return "butuh %d gold untuk mendirikan guild" % G.GUILD_BIAYA_BUAT, None
-        pemain.gold -= G.GUILD_BIAYA_BUAT
-        gid = self._gid_baru()
-        g = dict(id=gid, nama=nama, ketua_id=pemain.char_id, level=1, exp=0,
-                 kas=0, menang=0, kalah=0, war_akhir=0,
-                 anggota={pemain.char_id: dict(pangkat=G.P_KETUA, sumbang=0,
-                                               masuk=int(sekarang() // 1000))},
-                 undangan={})
-        self.guild[gid] = g
-        self.guild_by_nama[nama.lower()] = gid
-        pemain.guild = gid
-        self.guild_tandai(gid)
-        self.catat("guild_buat", nama, "oleh", pemain.nama)
-        return None, g
+            return "biaya buat guild %d gold" % G.GUILD_BIAYA_BUAT, None
+        if con:
+            cek = con.execute("SELECT id FROM guild WHERE nama = ? COLLATE NOCASE",
+                              (nama,)).fetchone()
+            if cek:
+                return "nama guild sudah dipakai", None
+            pemain.gold -= G.GUILD_BIAYA_BUAT
+            gid = DB.guild_buat(con, nama, pemain.char_id, pemain.nama)
+            baris = DB.guild_satu(con, gid)
+            g = GuildData(baris)
+            g.anggota[pemain.char_id] = {
+                "nama": pemain.nama, "pangkat": G.P_KETUA, "online": True
+            }
+            self.guild[gid] = g
+            pemain.guild_id = gid
+            pemain.guild_pangkat = G.P_KETUA
+            self.catat("guild_buat", pemain.nama, nama)
+            return None, g
+        return "koneksi DB tidak tersedia", None
 
-    def guild_undang(self, pemain, target):
-        g = self.guild_dari(pemain)
-        if not g:
-            return "kamu belum punya guild"
-        if self.guild_pangkat(pemain) < G.P_PERWIRA:
-            return "hanya perwira atau ketua yang boleh mengundang"
-        if target.guild:
-            return "%s sudah punya guild" % target.nama
-        if len(g["anggota"]) >= G.guild_anggota_maks(g["level"]):
-            return "guild penuh (maks %d di level %d)" % (
-                G.guild_anggota_maks(g["level"]), g["level"])
-        g.setdefault("undangan", {})[target.char_id] = sekarang() + 60000
-        return None
+    def guild_undang(self, pemain, target_eid):
+        g = self.guild_pemain(pemain)
+        if g is None:
+            return "kamu tidak punya guild", None
+        if pemain.guild_pangkat < G.P_PERWIRA:
+            return "hanya perwira/ketua yang bisa mengundang", None
+        peta = self.peta[pemain.map_id]
+        target = peta.pemain.get(target_eid)
+        if target is None:
+            return "pemain tidak ada di sini", None
+        if target.guild_id:
+            return "dia sudah punya guild", None
+        if len(g.anggota) >= G.guild_anggota_maks(g.level):
+            return "guild sudah penuh", None
+        return None, (g, target)
 
-    def guild_terima(self, pemain, gid):
+    def guild_terima_undangan(self, pemain, gid, con=None):
+        import db as DB
         g = self.guild.get(gid)
-        if not g:
-            return "guild tidak ada", None
-        if pemain.guild:
-            return "kamu sudah punya guild", None
-        batas = g.get("undangan", {}).get(pemain.char_id, 0)
-        if batas < sekarang():
-            return "undangan sudah kedaluwarsa", None
-        if len(g["anggota"]) >= G.guild_anggota_maks(g["level"]):
-            return "guild penuh", None
-        del g["undangan"][pemain.char_id]
-        g["anggota"][pemain.char_id] = dict(pangkat=G.P_ANGGOTA, sumbang=0,
-                                            masuk=int(sekarang() // 1000))
-        pemain.guild = gid
-        self.guild_tandai(gid)
-        self.catat("guild_masuk", pemain.nama, g["nama"])
-        return None, g
-
-    def guild_keluar(self, pemain):
-        g = self.guild_dari(pemain)
-        if not g:
-            return "kamu belum punya guild"
-        if g["ketua_id"] == pemain.char_id and len(g["anggota"]) > 1:
-            return "wariskan dulu jabatan ketua sebelum keluar"
-        g["anggota"].pop(pemain.char_id, None)
-        pemain.guild = None
-        if not g["anggota"]:
-            self._guild_hapus(g)
-        else:
-            self.guild_tandai(g["id"])
+        if g is None:
+            return "guild tidak ada"
+        if pemain.guild_id:
+            return "kamu sudah punya guild"
+        if len(g.anggota) >= G.guild_anggota_maks(g.level):
+            return "guild sudah penuh"
+        pemain.guild_id = gid
+        pemain.guild_pangkat = G.P_ANGGOTA
+        g.anggota[pemain.char_id] = {
+            "nama": pemain.nama, "pangkat": G.P_ANGGOTA, "online": True
+        }
+        g.kotor = True
+        if con:
+            DB.guild_tambah_anggota(con, gid, pemain.char_id,
+                                    pemain.nama, G.P_ANGGOTA)
+        self.catat("guild_terima", pemain.nama, g.nama)
         return None
 
-    def _guild_hapus(self, g):
-        self.guild.pop(g["id"], None)
-        self.guild_by_nama.pop(g["nama"].lower(), None)
-        self.guild_dihapus.add(g["id"])
-        self.guild_kotor.discard(g["id"])
-        w = self.war_aktif(g["id"])
-        if w:
-            self.war_selesai(w, "guild bubar")
-
-    def guild_bubar(self, pemain):
-        g = self.guild_dari(pemain)
-        if not g:
-            return "kamu belum punya guild"
-        if g["ketua_id"] != pemain.char_id:
-            return "hanya ketua yang boleh membubarkan guild"
-        for cid in list(g["anggota"].keys()):
-            anggota = self.pemain_by_char.get(cid)
-            if anggota:
-                anggota.guild = None
-        g["anggota"] = {}
-        self._guild_hapus(g)
-        self.catat("guild_bubar", g["nama"])
+    def guild_keluar(self, pemain, con=None):
+        import db as DB
+        g = self.guild_pemain(pemain)
+        if g is None:
+            return "kamu tidak punya guild"
+        if pemain.guild_pangkat == G.P_KETUA:
+            return "ketua harus bubarkan guild dulu"
+        g.anggota.pop(pemain.char_id, None)
+        pemain.guild_id = None
+        pemain.guild_pangkat = G.P_ANGGOTA
+        g.kotor = True
+        if con:
+            DB.guild_hapus_anggota(con, pemain.char_id)
+        self.catat("guild_keluar", pemain.nama, g.nama)
         return None
 
-    def guild_pecat(self, pemain, char_id):
-        g = self.guild_dari(pemain)
-        if not g:
-            return "kamu belum punya guild"
-        if char_id == pemain.char_id:
-            return "pakai keluar guild, bukan pecat"
-        korban = g["anggota"].get(char_id)
-        if not korban:
-            return "dia bukan anggota guild kamu"
-        aku = self.guild_pangkat(pemain)
-        if aku <= korban["pangkat"] or aku < G.P_PERWIRA:
-            return "pangkat kamu tidak cukup"
-        del g["anggota"][char_id]
-        lain = self.pemain_by_char.get(char_id)
-        if lain:
-            lain.guild = None
-        self.guild_tandai(g["id"])
+    def guild_tendang(self, pemain, target_char_id, con=None):
+        import db as DB
+        g = self.guild_pemain(pemain)
+        if g is None or pemain.guild_pangkat < G.P_PERWIRA:
+            return "tidak punya wewenang"
+        angg = g.anggota.get(target_char_id)
+        if angg is None:
+            return "bukan anggota guild"
+        if angg["pangkat"] >= pemain.guild_pangkat:
+            return "tidak bisa menendang yang pangkatnya sama atau lebih tinggi"
+        target = self.pemain_by_char.get(target_char_id)
+        if target:
+            target.guild_id = None
+            target.guild_pangkat = G.P_ANGGOTA
+        g.anggota.pop(target_char_id, None)
+        g.kotor = True
+        if con:
+            DB.guild_hapus_anggota(con, target_char_id)
+        self.catat("guild_tendang", pemain.nama, angg["nama"])
         return None
 
-    def guild_set_pangkat(self, pemain, char_id, pangkat):
-        g = self.guild_dari(pemain)
-        if not g:
-            return "kamu belum punya guild"
-        if g["ketua_id"] != pemain.char_id:
-            return "hanya ketua yang boleh mengatur pangkat"
-        a = g["anggota"].get(char_id)
-        if not a:
-            return "dia bukan anggota guild kamu"
-        pangkat = int(pangkat)
-        if pangkat not in (G.P_ANGGOTA, G.P_PERWIRA, G.P_KETUA):
-            return "pangkat tidak dikenal"
-        if pangkat == G.P_KETUA:
-            # warisan jabatan: ketua lama turun jadi perwira
-            g["anggota"][pemain.char_id]["pangkat"] = G.P_PERWIRA
-            g["ketua_id"] = char_id
-        a["pangkat"] = pangkat
-        self.guild_tandai(g["id"])
-        return None
-
-    def guild_tambah_exp(self, g, jumlah):
-        """-> jumlah level yang naik."""
-        naik = 0
-        g["exp"] += max(0, int(jumlah))
-        while g["level"] < G.GUILD_LEVEL_MAKS:
-            butuh = G.guild_exp_naik(g["level"])
-            if butuh <= 0 or g["exp"] < butuh:
+    def guild_sumbang(self, pemain, jumlah, con=None):
+        import db as DB
+        g = self.guild_pemain(pemain)
+        if g is None:
+            return "kamu tidak punya guild", 0
+        jumlah = max(G.GUILD_SUMBANG_MIN, int(jumlah))
+        if pemain.gold < jumlah:
+            return "gold kurang", 0
+        pemain.gold -= jumlah
+        g.kas += jumlah
+        exp_dapat = jumlah * G.GUILD_EXP_PER_GOLD
+        g.exp += exp_dapat
+        # naik level guild
+        while True:
+            butuh = G.guild_exp_naik(g.level)
+            if butuh <= 0 or g.exp < butuh:
                 break
-            g["exp"] -= butuh
-            g["level"] += 1
-            naik += 1
-        if g["level"] >= G.GUILD_LEVEL_MAKS:
-            g["exp"] = min(g["exp"], G.GUILD_EXP_NAIK[-1])
-        self.guild_tandai(g["id"])
-        return naik
+            g.exp -= butuh
+            g.level += 1
+        g.kotor = True
+        if con:
+            DB.guild_update(con, g.gid, g.level, g.exp, g.kas)
+        self.catat("guild_sumbang", pemain.nama, str(jumlah))
+        return None, exp_dapat
 
-    def guild_sumbang(self, pemain, gold):
-        g = self.guild_dari(pemain)
-        if not g:
-            return "kamu belum punya guild", 0
-        gold = int(gold)
-        if gold < G.GUILD_SUMBANG_MIN:
-            return "sumbangan minimal %d gold" % G.GUILD_SUMBANG_MIN, 0
-        if pemain.gold < gold:
-            return "gold kamu kurang", 0
-        pemain.gold -= gold
-        g["kas"] += gold
-        g["anggota"][pemain.char_id]["sumbang"] += gold
-        naik = self.guild_tambah_exp(g, gold * G.GUILD_EXP_PER_GOLD)
-        self.catat("guild_sumbang", pemain.nama, gold)
-        return None, naik
-
-    def guild_anggota_online(self, g):
-        return [self.pemain_by_char[c] for c in g["anggota"]
-                if c in self.pemain_by_char]
-
-    # -------------------------------------------------------------- war
-    def war_aktif(self, gid):
-        for w in self.war.values():
-            if gid in (w["a"], w["b"]) and not w["selesai"]:
-                return w
+    def guild_bubar(self, pemain, con=None):
+        import db as DB
+        g = self.guild_pemain(pemain)
+        if g is None:
+            return "kamu tidak punya guild"
+        if pemain.guild_pangkat != G.P_KETUA:
+            return "hanya ketua yang bisa membubarkan guild"
+        # online anggota dikeluarkan
+        for char_id in list(g.anggota.keys()):
+            p = self.pemain_by_char.get(char_id)
+            if p:
+                p.guild_id = None
+                p.guild_pangkat = G.P_ANGGOTA
+        if con:
+            DB.guild_hapus(con, g.gid)
+        del self.guild[g.gid]
+        self.catat("guild_bubar", pemain.nama, g.nama)
         return None
 
+    # ------------------------------------------------------------ war
     def war_deklarasi(self, pemain, nama_lawan, taruhan):
-        g = self.guild_dari(pemain)
-        if not g:
-            return "kamu belum punya guild", None
-        if g["ketua_id"] != pemain.char_id:
-            return "hanya ketua yang boleh menyatakan perang", None
-        gid_lawan = self.guild_by_nama.get((nama_lawan or "").strip().lower())
-        lawan = self.guild.get(gid_lawan)
-        if not lawan:
-            return "guild lawan tidak ada", None
-        if lawan["id"] == g["id"]:
-            return "tidak bisa perang melawan guild sendiri", None
+        g = self.guild_pemain(pemain)
+        if g is None:
+            return "kamu tidak punya guild", None
+        if pemain.guild_pangkat != G.P_KETUA:
+            return "hanya ketua yang bisa deklarasi perang", None
+        if g.level < G.WAR_LEVEL_MIN:
+            return "guild harus level %d" % G.WAR_LEVEL_MIN, None
         taruhan = int(taruhan)
-        if not G.WAR_TARUHAN_MIN <= taruhan <= G.WAR_TARUHAN_MAKS:
-            return "taruhan %d - %d gold" % (G.WAR_TARUHAN_MIN,
-                                             G.WAR_TARUHAN_MAKS), None
-        for sisi in (g, lawan):
-            if sisi["level"] < G.WAR_LEVEL_MIN:
-                return "kedua guild minimal level %d" % G.WAR_LEVEL_MIN, None
-            if sisi["kas"] < taruhan:
-                return "kas %s tidak cukup untuk taruhan itu" % sisi["nama"], None
-            if self.war_aktif(sisi["id"]):
-                return "%s sedang perang" % sisi["nama"], None
-            if sekarang() - sisi["war_akhir"] < G.WAR_COOLDOWN_MS:
-                return "%s masih masa istirahat perang" % sisi["nama"], None
-        self.war_ajakan[lawan["id"]] = dict(dari=g["id"], taruhan=taruhan,
-                                            batas=sekarang() + 120000)
-        self.catat("war_ajak", g["nama"], "vs", lawan["nama"], taruhan)
-        return None, self.war_ajakan[lawan["id"]]
+        if not (G.WAR_TARUHAN_MIN <= taruhan <= G.WAR_TARUHAN_MAKS):
+            return "taruhan %d-%d" % (G.WAR_TARUHAN_MIN, G.WAR_TARUHAN_MAKS), None
+        if g.kas < taruhan:
+            return "kas guild tidak cukup", None
+        # cari guild lawan
+        lawan = next((x for x in self.guild.values()
+                      if x.nama.lower() == nama_lawan.lower()), None)
+        if lawan is None:
+            return "guild '%s' tidak ditemukan" % nama_lawan, None
+        if lawan.gid == g.gid:
+            return "tidak bisa perang dengan guild sendiri", None
+        if g.war_id or lawan.war_id:
+            return "salah satu guild sedang dalam perang", None
+        return None, (g, lawan, taruhan)
 
-    def war_tolak(self, pemain):
-        g = self.guild_dari(pemain)
-        if not g:
-            return "kamu belum punya guild"
-        if g["ketua_id"] != pemain.char_id:
-            return "hanya ketua yang boleh menjawab tantangan"
-        if self.war_ajakan.pop(g["id"], None) is None:
-            return "tidak ada tantangan masuk"
+    def war_terima(self, pemain, wid):
+        w = self._war.get(wid)
+        if w is None:
+            return "tantangan perang tidak ada"
+        g = self.guild_pemain(pemain)
+        if g is None or g.gid != w.guild_b.gid:
+            return "bukan untukmu"
+        if pemain.guild_pangkat != G.P_KETUA:
+            return "hanya ketua yang bisa"
+        w.guild_a.kas -= w.taruhan
+        w.guild_b.kas -= w.taruhan
+        w.guild_a.kotor = True
+        w.guild_b.kotor = True
+        w.guild_a.war_id = wid
+        w.guild_b.war_id = wid
+        self.catat("war_mulai", w.guild_a.nama, w.guild_b.nama)
         return None
 
-    def war_terima(self, pemain):
-        g = self.guild_dari(pemain)
-        if not g:
-            return "kamu belum punya guild", None
-        if g["ketua_id"] != pemain.char_id:
-            return "hanya ketua yang boleh menerima tantangan", None
-        ajakan = self.war_ajakan.get(g["id"])
-        if not ajakan or ajakan["batas"] < sekarang():
-            self.war_ajakan.pop(g["id"], None)
-            return "tidak ada tantangan yang masih berlaku", None
-        penantang = self.guild.get(ajakan["dari"])
-        if not penantang:
-            self.war_ajakan.pop(g["id"], None)
-            return "guild penantang sudah bubar", None
-        taruhan = ajakan["taruhan"]
-        for sisi in (g, penantang):
-            if sisi["kas"] < taruhan:
-                self.war_ajakan.pop(g["id"], None)
-                return "kas %s tidak cukup lagi" % sisi["nama"], None
-            if self.war_aktif(sisi["id"]):
-                return "%s sedang perang" % sisi["nama"], None
-        del self.war_ajakan[g["id"]]
-        for sisi in (g, penantang):
-            sisi["kas"] -= taruhan
-            self.guild_tandai(sisi["id"])
-        self._war_id += 1
-        w = dict(id=self._war_id, a=penantang["id"], b=g["id"],
-                 nama_a=penantang["nama"], nama_b=g["nama"],
-                 mulai=sekarang(), akhir=sekarang() + G.WAR_DURASI_MS,
-                 taruhan=taruhan, skor={penantang["id"]: 0, g["id"]: 0},
-                 selesai=False, hasil=None)
-        self.war[w["id"]] = w
-        self.catat("war_mulai", penantang["nama"], "vs", g["nama"])
-        return None, w
+    def war_ajukan(self, g_ajak, g_lawan, taruhan):
+        self._war_counter += 1
+        wid = self._war_counter
+        w = WarData(wid, g_ajak, g_lawan, taruhan, sekarang())
+        self._war[wid] = w
+        return wid, w
 
     def war_bunuh(self, pemain, mob_level):
-        """Dipanggil dari mob_mati. -> war yang bertambah skornya atau None."""
-        if not pemain.guild:
-            return None
-        w = self.war_aktif(pemain.guild)
+        g = self.guild_pemain(pemain)
+        if g is None or g.war_id is None:
+            return
+        w = self._war.get(g.war_id)
         if w is None:
-            return None
-        w["skor"][pemain.guild] = w["skor"].get(pemain.guild, 0) + \
-            G.war_skor_mob(mob_level)
-        return w
+            return
+        w.skor[g.gid] = w.skor.get(g.gid, 0) + G.war_skor_mob(mob_level)
 
-    def war_selesai(self, w, alasan="waktu habis"):
-        """-> dict(menang, kalah, seri, hadiah_kas, skor)."""
-        if w["selesai"]:
-            return w["hasil"]
-        w["selesai"] = True
-        skr = sekarang()
-        ga = self.guild.get(w["a"])
-        gb = self.guild.get(w["b"])
-        sa = w["skor"].get(w["a"], 0)
-        sb = w["skor"].get(w["b"], 0)
-        pot = w["taruhan"] * 2
-        menang = kalah = None
-        if sa == sb or ga is None or gb is None:
-            # seri atau salah satu bubar: taruhan dikembalikan
-            for sisi in (ga, gb):
-                if sisi:
-                    sisi["kas"] += w["taruhan"]
-                    sisi["war_akhir"] = skr
-                    self.guild_tandai(sisi["id"])
+    def _cek_war(self, skr):
+        peristiwa = []
+        for wid, w in list(self._war.items()):
+            if skr >= w.selesai:
+                hasil = self._selesaikan_war(w)
+                del self._war[wid]
+                peristiwa.append(("war_selesai", wid, hasil))
+        return peristiwa
+
+    def _selesaikan_war(self, w):
+        sa = w.skor.get(w.guild_a.gid, 0)
+        sb = w.skor.get(w.guild_b.gid, 0)
+        seri = sa == sb
+        if seri:
+            menang = None
+            kalah = None
+            w.guild_a.kas += w.taruhan
+            w.guild_b.kas += w.taruhan
+            hadiah_kas = w.taruhan
         else:
-            menang, kalah = (ga, gb) if sa > sb else (gb, ga)
-            menang["kas"] += pot
-            menang["menang"] += 1
-            kalah["kalah"] += 1
-            self.guild_tambah_exp(menang, G.WAR_EXP_MENANG)
-            self.guild_tambah_exp(kalah, G.WAR_EXP_KALAH)
-            for sisi in (menang, kalah):
-                sisi["war_akhir"] = skr
-                self.guild_tandai(sisi["id"])
-        hasil = dict(war=w["id"], alasan=alasan, seri=menang is None,
-                     menang=menang["nama"] if menang else "",
-                     kalah=kalah["nama"] if kalah else "",
-                     menang_id=menang["id"] if menang else 0,
-                     kalah_id=kalah["id"] if kalah else 0,
-                     hadiah_kas=pot if menang else w["taruhan"],
-                     skor_a=sa, skor_b=sb)
-        w["hasil"] = hasil
-        self.catat("war_selesai", hasil["menang"] or "seri", sa, sb)
-        return hasil
+            if sa > sb:
+                menang, kalah = w.guild_a, w.guild_b
+            else:
+                menang, kalah = w.guild_b, w.guild_a
+            menang.kas += w.taruhan * 2
+            menang.menang += 1
+            kalah.kalah += 1
+            hadiah_kas = w.taruhan * 2
+        for g in (w.guild_a, w.guild_b):
+            g.war_id = None
+            g.kotor = True
+        w.guild_a.exp += G.WAR_EXP_MENANG if (not seri and menang == w.guild_a) \
+            else G.WAR_EXP_KALAH
+        w.guild_b.exp += G.WAR_EXP_MENANG if (not seri and menang == w.guild_b) \
+            else G.WAR_EXP_KALAH
+        return {
+            "menang": menang.nama if menang else None,
+            "menang_id": menang.gid if menang else None,
+            "kalah_id": kalah.gid if kalah else None,
+            "skor_a": sa, "skor_b": sb,
+            "hadiah_kas": hadiah_kas,
+            "seri": seri,
+        }
 
-    def war_tick(self):
-        """Tutup perang yang waktunya habis. -> daftar hasil."""
-        keluar = []
-        skr = sekarang()
-        for w in list(self.war.values()):
-            if w["selesai"]:
-                if skr - w["akhir"] > 300000:
-                    del self.war[w["id"]]
-                continue
-            if skr >= w["akhir"]:
-                keluar.append(self.war_selesai(w, "waktu habis"))
-        for gid, ajakan in list(self.war_ajakan.items()):
-            if ajakan["batas"] < skr:
-                del self.war_ajakan[gid]
-        return keluar
+    def catat(self, *args):
+        pass  # di-override atau diganti DB.catat di app.py
