@@ -1,0 +1,15 @@
+# build klien
+client/build/
+client/dist/
+
+# python
+__pycache__/
+*.pyc
+
+# data server
+server/data/
+*.db
+*.db-journal
+
+# lain-lain
+.DS_Store

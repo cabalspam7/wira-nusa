@@ -1,0 +1,11 @@
+MIDlet-1: Wira Nusa,/icon.png,Main
+MIDlet-Name: Wira Nusa
+MIDlet-Version: @VERSI@
+MIDlet-Vendor: Karya Sendiri
+MIDlet-Jar-URL: @NAMAJAR@
+MIDlet-Jar-Size: @UKURAN@
+MIDlet-Description: MMORPG ringan bergaya nusantara untuk HP Java
+MIDlet-Icon: /icon.png
+MicroEdition-Configuration: CLDC-1.0
+MicroEdition-Profile: MIDP-2.0
+MIDlet-Permissions: javax.microedition.io.Connector.socket
